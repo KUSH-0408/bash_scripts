@@ -1,0 +1,60 @@
+#!/bin/bash
+set -eu
+
+if ! hash aws &>/dev/null; then
+    echo -e "\nThis script requires AWS CLI...\n"
+    echo -e "Visit following link for AWS CLI installation instruction...\n"
+    echo -e "https://docs.aws.amazon.com/cli/latest/userguide/install-cliv1.html\n"
+    echo -e "Exiting...\n"
+    exit 1
+fi
+
+AWS_SHARED_CREDENTIALS_FILE=$HOME/.aws/credentials
+
+if [ ! -f "$AWS_SHARED_CREDENTIALS_FILE" ]; then
+    echo -e "\n$AWS_SHARED_CREDENTIALS_FILE file does not exist.  Please create it...\n"
+    echo -e "Exiting...\n"
+    exit 1
+fi
+
+echo -e "\nCAUTION: This script will overwrite the contents of $AWS_SHARED_CREDENTIALS_FILE file...\n"
+
+read -r -p "Press Y to proceed or press N to exit [Y/N]: " response
+if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+    echo -e "Proceeding...\n"
+else
+    echo -e "Exiting...\n"
+    exit 1
+fi
+
+# unset existing values
+unset AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY
+unset AWS_SESSION_TOKEN
+
+echo '' >"$AWS_SHARED_CREDENTIALS_FILE"
+
+# read SAML response
+read -r -e -p "Enter SAML response: " saml_response
+
+echo -e "\nPlease wait...\n"
+
+principal=$(echo "$saml_response" | base64 -d | tr '<' '\n' | sed -e 's/^/</' | grep 'saml-provider' | cut -d ',' -f 1 | cut -d '>' -f 2)
+
+role=$(echo "$saml_response" | base64 -d | tr '<' '\n' | sed -e 's/^/</' | grep 'saml-provider' | cut -d ',' -f 2)
+
+sts=$(aws sts assume-role-with-saml --role-arn "$role" --principal-arn "$principal" --saml-assertion "$saml_response" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+
+AWS_ACCESS_KEY_ID=$(echo "$sts" | awk '{ print $1}')
+AWS_SECRET_ACCESS_KEY=$(echo "$sts" | awk '{ print $2}')
+AWS_SESSION_TOKEN=$(echo "$sts" | awk '{ print $3}')
+
+echo -e "Overwriting $AWS_SHARED_CREDENTIALS_FILE with temporary credentials...\n"
+{
+    echo '[default]'
+    echo "aws_access_key_id = ${AWS_ACCESS_KEY_ID}"
+    echo "aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}"
+    echo "aws_session_token = ${AWS_SESSION_TOKEN}"
+} >"$AWS_SHARED_CREDENTIALS_FILE"
+
+echo -e "Done\n"
