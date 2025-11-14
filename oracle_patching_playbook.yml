@@ -1,0 +1,28 @@
+---
+- name: Oracle patching
+  hosts: group1
+  become: yes
+  tasks:
+
+    - name: Backup .repo files except local.repo
+      ansible.builtin.shell: |
+        find /etc/yum.repos.d -maxdepth 1 -name "*.repo" ! -name "*.repo.*" ! -name "*.repo-*" ! -name "local.repo" -exec mv {} {}.bkp-$(date +%Y-%m-%d) \;
+      args:
+        warn: false
+
+    - name: Update /etc/machine-id with the system UUID
+      ansible.builtin.shell: |
+        dmidecode | grep -i uuid | awk '{print $2}' > /etc/machine-id
+      args:
+        warn: false
+
+    - name: Check if /etc/machine-id was successfully created
+      ansible.builtin.stat:
+        path: /etc/machine-id
+      register: machine_id_stat
+
+    - name: Update pkg if machine-id exists
+      command: dnf update -y
+      async: 3600
+      poll: 0
+      when: machine_id_stat.stat.exists == True
