@@ -1,0 +1,972 @@
+include:
+  - project: 'devops/central-ci'
+    ref: master
+    file:
+      - 'jobs/by-stage/scan/checkmarx-scan.yml'
+      - 'jobs/by-stage/scan/black-duck-scan.yml'
+      - '/jobs/by-language/java/mvn-verify-new-sonar-java17.yml'
+  - project: devops/central-ci
+    file: jobs/by-stage/scan/black-duck-scan.yml
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN -Dorg.slf4j.simpleLogger.showDateTime=true -Djava.awt.headless=true"
+  MAVEN_REPO: "-B -s .m2/settings.xml"
+  KUBERNETES_DEPLOYMENT_NAME: decisioning
+  KUBERNETES_NAMESPACE: default
+  KUBERNETES_FOLDER: decisioning
+  KUBERNETES_DEPLOYMENT_FILE: decisioning-deployment.yaml
+  KUBERNETES_CANERY_DEPLOYMENT_FILE: decisioning-canary-deployment.yaml
+  ### DECISIONING SANDBOX VARIABLES ###
+  KUBERNETES_SANDBOX_NAMESPACE: sandbox
+  KUBERNETES_SANDBOX_DEPLOYMENT_FILE: decisioning-sandbox-deployment.yaml
+  KUBERNETES_SANDBOX_FOLDER: decisioning-sandbox
+  END_TO_END_IMAGE: dcr.fini.city/decisioning/end-to-end-tests:latest
+  CX_FLOW_FILTER_SEVERITY: Medium
+
+stages:
+  - validate
+  - test
+  - sonar-scan
+  - upload
+  - docker-build
+  - scan
+  - dev-deploy
+  - devb-deploy
+  - stage-deploy
+  - e2e-test
+  - prod-sandbox-deploy
+  - canary-deploy
+  - prod-deploy
+
+############# Maven Build Java-17####################
+### Validation stage
+maven-openjdk-17-validate:feature:
+  image: maven:3-openjdk-17-slim
+  stage: validate
+  script: "mvn clean validate"
+  except:
+    - develop
+    - master
+    - /^DECISIONING-.*$/
+
+### Test Stage ###
+
+## Feature Test w/ Sonar
+# maven-test-and-sonar-openjdk-17:feature:
+#   image: maven:3-openjdk-17-slim
+#   stage: test
+#   script: 
+#     - "mvn clean"
+#     - "mvn $MAVEN_CLI_OPTS verify sonar:sonar -Dsonar.host.url=https://sonarqube.fini.city -Dsonar.login=$SONAR_LOGIN -Dsonar.gitlab.project_id=$CI_PROJECT_PATH -Dsonar.gitlab.commit_sha=$CI_COMMIT_SHA -Dsonar.gitlab.ref_name=$CI_COMMIT_REF_NAME | grep -v 'at ' | grep -v 'Progress (' | grep -v 'Downloading from' | grep -v 'Downloaded from'"
+#   when: manual
+#   allow_failure: false
+#   except:
+#     - develop
+#     - master
+#     - /^DECISIONING-.*$/
+
+
+## Master and Develop MR Test w/ Sonar
+# maven-test-and-sonar-openjdk-17:develop-master-mr:
+#   extends: maven-test-and-sonar-openjdk-17:feature
+#   when: on_success
+#   except:
+#   only:
+#     refs:
+#       - develop
+#       - master
+#       - merge_requests
+#     variables:
+#       - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
+#       - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"
+
+
+# Master and Develop MR Test w/ Sonar
+mvn-verify-scan:develop-master-mr:
+  extends: mvn-verify-sonar
+  when: on_success
+  except:
+  only:
+    refs:
+      - develop
+      - master
+      - merge_requests
+    variables:
+      - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
+      - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"
+
+
+## Develop and Master Branch Test wo/ Sonar
+maven-test-no-sonar-openjdk-17:develop-master:
+  image: maven:3-eclipse-temurin-21
+  stage: test
+  script: "mvn $MAVEN_CLI_OPTS test | grep -v 'at ' | grep -v 'Progress (' | grep -v 'Downloading from' | grep -v 'Downloaded from'"
+  when: on_success
+  except:
+  only:
+    refs:
+      - master
+
+mvn-verify-sonar: 
+  stage: sonar-scan
+  except:
+    - FAL-6155-research-dec
+
+### Upload Stage ###
+
+## Feature Upload Manual Only
+maven-upload-openjdk-17:feature:
+  image: maven:3-openjdk-17-slim
+  stage: upload
+  script: "mvn $MAVEN_REPO -DskipTests deploy"
+  when: manual
+  except:
+    - develop
+    - master
+    - /^DECISIONING-.*$/
+    
+
+# Develop and Master Upload
+maven-upload-openjdk-17:develop-master:
+  extends: maven-upload-openjdk-17:feature
+  ###when: on_success
+  except:
+  only:
+    - develop
+    - master
+    - /^DECISIONING-.*$/
+
+########### Java-17 Maven Block End here #################
+##########################################################
+### Docker Build Stage ###
+
+## Docker Build Manual Only
+docker-build:feature:
+  ## image: docker:latest
+  stage: docker-build
+  script:
+    - mkdir -p $HOME/.docker
+    - echo $DOCKER_AUTH_CONFIG > $HOME/.docker/config.json
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker build --pull -t $CI_REGISTRY_IMAGE:$CI_PIPELINE_ID .
+    - docker push $CI_REGISTRY_IMAGE:$CI_PIPELINE_ID
+    - export DIGEST=$(docker images --digests --no-trunc | grep $CI_REGISTRY_IMAGE | grep $CI_PIPELINE_ID | tr -s " " "\t" | cut -f3)
+    - export AWS_REGION=$COSIGN_AWS_REGION
+    - cosign sign --key awskms:///$COSIGN_KMS_KEY_ALIAS --tlog-upload=false $CI_REGISTRY_IMAGE@$DIGEST
+  when: manual
+  allow_failure: true
+  except:
+    - develop
+    - develop_australia
+    - develop_brazil
+    - master
+    - /^DECISIONING-.*$/
+  before_script:
+    - 'wget -O cosign --header="JOB-TOKEN: $CI_JOB_TOKEN" ${CI_API_V4_URL}/projects/2759/packages/generic/cosign/v2.0.0/cosign-linux-amd64'
+    - chmod +x cosign
+    - mv cosign /bin
+
+## Develop and Master MR Docker Build
+docker-build:develop-master-mr:
+  extends: docker-build:feature
+  when: on_success
+  except:
+  only:
+    refs:
+      - merge_requests
+    variables:
+      - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"
+      - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
+
+## Develop and Master Docker Build
+docker-build:develop-master:
+  extends: docker-build:feature
+  when: on_success
+  except:
+  only:
+    - develop
+    - develop_australia
+    - develop_brazil
+    - master
+    - /^DECISIONING-.*$/
+
+### Scan Stage ###
+
+## Feature Twistlock Manual Only
+twistlock-scan:feature:
+  image: dcr.fini.city/devops/osiris
+  stage: scan
+  script:
+    - scan_container $CI_REGISTRY_IMAGE:$CI_PIPELINE_ID
+  allow_failure:
+    exit_codes: [2]
+  when: manual
+  except:
+    - develop
+    - master
+    - /^DECISIONING-.*$/
+
+## Feature Blackduck Manual Only
+decisioning_black_duck_scan:feature:
+  extends: black-duck-scan
+  stage: scan
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "develop"
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "master"
+      when: never
+    - if: $CI_COMMIT_REF_NAME =~ /^DECISIONING-.*$/
+      when: never
+    - when: manual
+
+## Enabling twistlock-scan for master
+twistlock-scan:master:
+  extends: twistlock-scan:feature
+  when: on_success
+  except:
+  only:
+    refs:
+      - merge_requests
+    variables:
+      - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"
+
+twistlock-scan:
+  image: dcr.fini.city/devops/osiris
+  stage: scan
+  script:
+    - scan_container $CI_REGISTRY_IMAGE:$CI_PIPELINE_ID
+  allow_failure:
+    exit_codes: [2]
+  only:
+    - master
+
+decisioning_black_duck_scan:manual:
+  extends: black-duck-scan
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "master"'
+  when: manual
+
+
+
+### Develop Deploy Stage ###
+
+
+k8s-dev-b:
+  image: dcr.fini.city/devops/kubectl:uswestdevb
+  stage: devb-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/k8s-dev.git devb-deploy
+    - "[[ -d devb-deploy/${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER} ]] && true || mkdir -pv devb-deploy/${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}"
+    - "cp kubernetes.yml devb-deploy/${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/"
+    - cd devb-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/kubernetes.yml"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/*.yml
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  only:
+    - develop
+    - /^DECISIONING-.*$/
+  environment:
+    name: develop
+  when: manual
+
+## Develop Deploy
+dev-deploy:
+  image: dcr.fini.city/devops/kubectl:uswestdeva
+  variables:
+    DEPLOY_ENV: k8s-dev
+  stage: dev-deploy
+  script:
+    #- kubectl config use-context ${DEPLOY_ENV}
+    #- kubectl config use-context us-west-2-k8s-dev.fini.city
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" kubernetes.yml"
+    - kubectl apply -f kubernetes.yml
+    - kubectl rollout status deployment/${KUBERNETES_DEPLOYMENT_NAME}
+  environment:
+    name: dev
+    url: https://decisioning.dev.fini.city
+  only:
+    - develop
+    - /^DECISIONING-.*$/
+  when: manual
+### E2E test Stage: Develop ###
+
+## E2E test
+e2e-test:develop:
+  ## image: docker:latest
+  when: manual
+  variables:
+    COUNTRY: '-Dgroups=US'
+    TEST_ENV: '-Dtest.profile=dev'
+    CLASS_FILTER: '-DtestClassFilter=.*ATCase'
+    HOST_ENTRY: 'api.finicitydev.com:10.22.1.38'
+    IS_RESELLER: '-DisReseller=false'
+  stage: e2e-test
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker pull ${END_TO_END_IMAGE}
+    - docker run --add-host ${HOST_ENTRY} -e JAVA_PROFILE=${TEST_ENV} -e COUNTRY=${COUNTRY} -e CLASS_FILTER=${CLASS_FILTER} -e IS_RESELLER=${IS_RESELLER} ${END_TO_END_IMAGE}
+    #- docker run --add-host ${HOST_ENTRY} -e JAVA_OPTS=${TEST_ENV} ${END_TO_END_IMAGE}
+    #- docker run --add-host ${HOST_ENTRY} -e JAVA_OPTS="-Dtest.profile=dev -Dgroups=US -Dthread.count=10" ${END_TO_END_IMAGE}
+  only:
+    - develop
+    - /^DECISIONING-.*$/
+
+## E2E test master primary shard
+e2e-test:master:
+  extends: e2e-test:develop
+  variables:
+    TEST_ENV: -Dtest.profile=stg
+  allow_failure: false
+  only:
+    - master
+
+## RESELLER E2E Test master
+e2e-test:master-reseller:
+  extends: e2e-test:develop
+  variables:
+    TEST_ENV: -Dtest.profile=stg
+    IS_RESELLER: '-DisReseller=true'
+  allow_failure: true
+  only:
+    - master #will have enable once testing is completed
+    - FAL-0000-reseller
+
+## RESELLER E2E Test develop
+e2e-test:develop-reseller:
+  extends: e2e-test:develop
+  variables:
+    TEST_ENV: -Dtest.profile=dev
+    IS_RESELLER: '-DisReseller=true'
+  allow_failure: true
+  only:
+    - develop 
+
+## CPP E2E Test master
+e2e-test:master-cpp:
+  extends: e2e-test:develop
+  variables:
+    TEST_ENV: -Dtest.profile=stg
+    CLASS_FILTER: '-DtestClassFilter=.*CppCaseAT'
+  allow_failure: false
+  only:
+    - master
+
+## CPP E2E test develop US
+e2e-test:develop-cpp:
+  extends: e2e-test:develop
+  variables:
+    CLASS_FILTER: '-DtestClassFilter=.*CppCaseAT'
+  allow_failure: true
+  only:
+    - develop
+
+## E2E test develop AU
+e2e-test:develop-au:
+  extends: e2e-test:develop
+  variables:
+    HOST_ENTRY: 'api.dev.openbanking.mastercard.com.au:45.223.18.70'
+    COUNTRY: '-Dgroups=AU'
+  allow_failure: false
+  only:
+    - develop
+## E2E test master AU
+e2e-test:master-au:
+  extends: e2e-test:develop
+  variables:
+    HOST_ENTRY: 'api.dev.openbanking.mastercard.com.au:45.223.18.70'
+    TEST_ENV: '-Dtest.profile=stg'
+    COUNTRY: '-Dgroups=AU'
+  allow_failure: false
+  only:
+    - master
+
+### Master Staging Deploy Stage ###
+
+## Master Decisioning Deploy Manual Only
+stage-deploy:
+  image: dcr.fini.city/devops/gitssh
+  stage: stage-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/k8s-stage.git stage-deploy
+    - cd stage-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  only:
+    - master
+  when: manual
+  environment:
+    name: stage
+    url: https://decisioning.stg.fini.city
+
+### Master Prod Deploy Stage ###
+
+## Start Canary Prod Deploy ##
+start-canary-prod-deploy:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - "sed -i \"s#replicas: 0.*#replicas: 1#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: canary
+    url: https://decisioning.prod.fini.city
+
+## Stop Canary Prod Deploy ##
+stop-canary-prod-deploy:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#replicas: 1.*#replicas: 0#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} stopped canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: canary
+    url: https://decisioning.prod.fini.city
+
+## Master Prod Decisioning Deploy Manual Only
+prod-deploy:
+  image: dcr.fini.city/devops/gitssh
+  stage: prod-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: production
+    url: https://decisioning.prod.fini.city
+
+
+## Start PROD Sandbox Deploy ##
+start-prod-sandbox-deploy:
+  image: dcr.fini.city/devops/gitssh
+  stage: prod-sandbox-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_SANDBOX_NAMESPACE}/${KUBERNETES_SANDBOX_FOLDER}/${KUBERNETES_SANDBOX_DEPLOYMENT_FILE}"
+    - "sed -i \"s#replicas: 0.*#replicas: 2#g\" ${KUBERNETES_SANDBOX_NAMESPACE}/${KUBERNETES_SANDBOX_FOLDER}/${KUBERNETES_SANDBOX_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-sandbox-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_SANDBOX_NAMESPACE}/${KUBERNETES_SANDBOX_FOLDER}/${KUBERNETES_SANDBOX_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed sandbox pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-sandbox-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: prod-sandbox
+    url: https://decisioning-sandbox.prod.fini.city
+
+## Stop PROD Sandbox Deploy ##
+stop-prod-sandbox-deploy:
+  image: dcr.fini.city/devops/gitssh
+  stage: prod-sandbox-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#replicas: 2.*#replicas: 0#g\" ${KUBERNETES_SANDBOX_NAMESPACE}/${KUBERNETES_SANDBOX_FOLDER}/${KUBERNETES_SANDBOX_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-sandbox-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_SANDBOX_NAMESPACE}/${KUBERNETES_SANDBOX_FOLDER}/${KUBERNETES_SANDBOX_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} stopped sandbox pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-sandbox-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: prod-sandbox
+    url: https://decisioning-sandbox.prod.fini.city
+
+##################################### Canada Deployment ######################################
+
+dev-deploy-ca:
+  image: dcr.fini.city/devops/gitssh
+  stage: dev-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - kubectl config use-context ${DEPLOY_ENV}
+    - git clone git@gitlab.fini.city:devops/k8s-dev-ca.git dev-deploy
+    - cd dev-deploy
+    ##    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" kubernetes.yml"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  ##    - kubectl apply -f kubernetes.yml
+  ##    - kubectl rollout status deployment/${KUBERNETES_DEPLOYMENT_NAME}
+
+  environment:
+    name: dev-ca
+    url: http://decisioning-ca.dev.fini.city
+  only:
+    - develop
+    - /^DECISIONING-.*$/
+  when: manual
+
+### Master Staging Deploy Stage ###
+
+
+## Master Decisioning Deploy Manual Only
+stage-deploy-ca:
+  image: dcr.fini.city/devops/gitssh
+  stage: stage-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/k8s-stage-ca.git stage-deploy
+    - cd stage-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  only:
+    - master
+  when: manual
+  environment:
+    name: stage-ca
+    url: https://decisioning-ca.stg.fini.city
+
+### Master Prod Deploy Stage ###
+
+## Start Canary Prod Deploy ##
+start-canary-prod-deploy-ca:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s-ca.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - "sed -i \"s#replicas: 0.*#replicas: 1#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: canary-ca
+    url: https://decisioning-ca.prod.fini.city
+
+## Stop Canary Prod Deploy ##
+stop-canary-prod-deploy-ca:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s-ca.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#replicas: 1.*#replicas: 0#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} stopped canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: canary-ca
+    url: https://decisioning-ca.prod.fini.city
+
+
+## Master Prod Decisioning Deploy Manual Only
+prod-deploy-ca:
+  image: dcr.fini.city/devops/gitssh
+  stage: prod-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops/prod-agg-k8s-ca.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master
+  when: manual
+  environment:
+    name: production
+    url: https://decisioning-ca.prod.fini.city
+
+################# Australia Deployment Stages ################
+
+dev-deploy-aus:
+  image: dcr.fini.city/devops/gitssh
+  stage: dev-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-australia/k8s-dev-aus.git dev-deploy
+    - cd dev-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  environment:
+    name: dev-aus
+    url: http://decisioning-aus.dev.fini.city
+  only:
+    - develop
+    - develop_australia
+    - /^DECISIONING-.*$/
+  when: manual
+
+### Master Staging Deploy Stage ###
+
+
+## Master Decisioning Deploy Manual Only
+stage-deploy-australia:
+  image: dcr.fini.city/devops/gitssh
+  stage: stage-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-australia/k8s-stage-aus.git stage-deploy
+    - cd stage-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  only:
+    - master_australia
+    - master
+  when: manual
+  environment:
+    name: stage-aus
+    url: https://decisioning-aus.stg.fini.city
+
+### Master Prod Deploy Stage ###
+
+## Start Canary Prod Deploy ##
+start-canary-prod-deploy-australia:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-australia/prod-agg-k8s-aus.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - "sed -i \"s#replicas: 0.*#replicas: 1#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master_australia
+    - master
+  when: manual
+  environment:
+    name: canary-aus
+    url: https://decisioning-aus.prod.fini.city
+
+## Stop Canary Prod Deploy ##
+stop-canary-prod-deploy-australia:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-australia/prod-agg-k8s-aus.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#replicas: 1.*#replicas: 0#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} stopped canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master_australia
+    - master
+  when: manual
+  environment:
+    name: canary-aus
+    url: https://decisioning-aus.prod.fini.city
+
+## Master Prod Decisioning Deploy Manual Only
+prod-deploy-australia:
+  image: dcr.fini.city/devops/gitssh
+  stage: prod-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-australia/prod-agg-k8s-aus.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master_australia
+    - master
+  when: manual
+  environment:
+    name: production_aus
+    url: https://decisioning-aus.prod.fini.city
+    ################# Brazil Deployment Stages ################
+
+dev-deploy-br:
+  image: dcr.fini.city/devops/gitssh
+  stage: dev-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-brazil/k8s-dev-br.git dev-deploy
+    - cd dev-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  environment:
+    name: dev-br
+    url: http://decisioning-br.dev.fini.city
+  only:
+    - develop
+    - develop_brazil
+    - /^DECISIONING-.*$/
+  when: manual
+
+### Master Staging Deploy Stage ###
+
+## Master Decisioning Deploy Manual Only
+stage-deploy-brazil:
+  image: dcr.fini.city/devops/gitssh
+  stage: stage-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${STAGE_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-brazil/k8s-stage-br.git stage-deploy
+    - cd stage-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push
+  only:
+    - master_brazil
+    - master
+  when: manual
+  environment:
+    name: stage-br
+    url: https://decisioning-br.stg.fini.city
+
+### Master Prod Deploy Stage ###
+
+## Start Canary Prod Deploy ##
+start-canary-prod-deploy-brazil:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-brazil/prod-core-k8s-br.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - "sed -i \"s#replicas: 0.*#replicas: 1#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master_brazil
+    - master
+  when: manual
+  environment:
+    name: canary-br
+    url: https://decisioning-br.prod.fini.city
+
+## Stop Canary Prod Deploy ##
+stop-canary-prod-deploy-brazil:
+  image: dcr.fini.city/devops/gitssh
+  stage: canary-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-brazil/prod-core-k8s-br.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#replicas: 1.*#replicas: 0#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_CANERY_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} stopped canary pod for ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master_brazil
+    - master
+  when: manual
+  environment:
+    name: canary-br
+    url: https://decisioning-br.prod.fini.city
+
+
+## Master Prod Decisioning Deploy Manual Only
+prod-deploy-brazil:
+  image: dcr.fini.city/devops/gitssh
+  stage: prod-deploy
+  script:
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "${PROD_K8S_REPO_KEY}" | base64 -d > ~/.ssh/id_rsa
+    - chmod 0600 ~/.ssh/id_rsa
+    - echo "${GITLAB_KNOWN_HOSTS}" | base64 -d > ~/.ssh/known_hosts
+    - git clone git@gitlab.fini.city:devops-brazil/prod-core-k8s-br.git prod-deploy
+    - cd prod-deploy
+    - "sed -i \"s#image: ${CI_REGISTRY_IMAGE}:.*#image: ${CI_REGISTRY_IMAGE}:${CI_PIPELINE_ID}#g\" ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}"
+    - git pull
+    - git checkout -b ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+    - git add ${KUBERNETES_NAMESPACE}/${KUBERNETES_FOLDER}/${KUBERNETES_DEPLOYMENT_FILE}
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - "git commit -m \"${GITLAB_USER_NAME} deployed ${CI_PROJECT_NAME} through GitLab Pipeline ID ${CI_PIPELINE_ID}\""
+    - git push -u origin ${CI_PROJECT_NAME}-${CI_PIPELINE_ID}
+  only:
+    - master_brazil
+  when: manual
+  environment:
+    name: production_br
+    url: https://decisioning-br.prod.fini.city
