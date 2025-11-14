@@ -1,0 +1,15 @@
+- name: Server Patching
+  hosts: all
+  become: yes
+  tasks:
+    - name: check boot space
+      shell: "df -h | grep -i /boot"
+    - name: remove kernel
+      shell: "package-cleanup --oldkernels --count=2 -y"
+    - name: Upgrade all packages, excluding critical packages
+      async: 3600
+      poll: 0
+      ansible.builtin.yum:
+       name: '*'
+       state: latest
+       exclude: nginx*,NGINX*,Nginx*,solr*,tomcat*,percona*,apache*,jetty*,Nodejs*,nodejs*,PHP*,php*,mysql*,MYSQL*,mongo*,maria*,MariaDB*,galera*,heartbeat*,docker*,openresty*,dante*
